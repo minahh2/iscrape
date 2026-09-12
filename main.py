@@ -1,78 +1,118 @@
 from fastapi import FastAPI, Query, Body
 from curl_cffi import requests
 from bs4 import BeautifulSoup
+from playwright.async_api import async_playwright
 import urllib.parse
+import asyncio
 import json
 import re
 
-app = FastAPI(title="Competitor Price Scraper Service", version="1.0.0")
+app = FastAPI(title="Competitor Price Engine", version="2.0.0")
+
+# Persistent browser instance across requests
+browser = None
+playwright = None
+
+@app.on_event("startup")
+async def startup_event():
+    global playwright, browser
+    playwright = await async_playwright().start()
+    browser = await playwright.chromium.launch(
+        headless=True,
+        args=[
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-blink-features=AutomationControlled"
+        ]
+    )
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    global browser, playwright
+    if browser:
+        await browser.close()
+    if playwright:
+        await playwright.stop()
 
 @app.get("/health")
-def health_check():
+def health():
     return {"status": "ok", "port": 5009}
 
 @app.api_route("/get-price", methods=["GET", "POST"])
-def get_price(
-    url: str = Query(None),
-    payload: dict = Body(None)
-):
+async def get_price(url: str = Query(None), payload: dict = Body(None)):
     target_url = url or (payload.get("url") if payload else None)
     if not target_url:
         return {"status": "error", "message": "Missing 'url' parameter"}
 
-    # Strip marketing trackers (gclid, gbraid) while keeping variants/attributes
     cleaned_url = clean_tracking_params(target_url)
 
+    # -------------------------------------------------------------
+    # TIER 1: FAST PATH via curl_cffi (No custom headers to prevent 403)
+    # -------------------------------------------------------------
     try:
-        # Impersonate Chrome 124 browser TLS/JA3 handshake to bypass Cloudflare
-        resp = requests.get(
-            cleaned_url,
-            impersonate="chrome124",
-            headers={
-                "Accept-Language": "en-US,en;q=0.9,ar;q=0.8",
-                "Upgrade-Insecure-Requests": "1"
-            },
-            timeout=15,
-            allow_redirects=True
+        session = requests.Session(impersonate="chrome")
+        resp = session.get(cleaned_url, timeout=12, allow_redirects=True)
+        html = resp.text
+        code = resp.status_code
+
+        # Check for Cloudflare interstitial or hard blocks
+        is_cf = (
+            code in [403, 503] or
+            "One moment, please..." in html or
+            "Just a moment..." in html or
+            "Attention Required!" in html or
+            "cloudflare" in html.lower() and code != 200
         )
+
+        if not is_cf and code == 200:
+            price = extract_price(cleaned_url, html)
+            if price and price > 0:
+                return {"status": "success", "price": price, "method": "curl_cffi", "url": cleaned_url}
+            if is_out_of_stock_page(html):
+                return {"status": "out_of_stock", "price": None, "url": cleaned_url}
+    except Exception:
+        pass
+
+    # -------------------------------------------------------------
+    # TIER 2: BROWSER FALLBACK (Bypasses Cloudflare Turnstile)
+    # -------------------------------------------------------------
+    try:
+        page_html = await fetch_with_browser(cleaned_url)
+        price = extract_price(cleaned_url, page_html)
+
+        if price and price > 0:
+            return {"status": "success", "price": price, "method": "browser_bypass", "url": cleaned_url}
+
+        if is_out_of_stock_page(page_html):
+            return {"status": "out_of_stock", "price": None, "url": cleaned_url}
+
+        return {"status": "attention_needed", "price": None, "url": cleaned_url}
     except Exception as e:
-        return {"status": "invalid_link", "message": str(e), "url": cleaned_url}
+        return {"status": "error", "message": str(e), "url": cleaned_url}
 
-    if resp.status_code in [404, 410]:
-        return {"status": "invalid_link", "code": resp.status_code, "url": cleaned_url}
 
-    if resp.status_code == 403:
-        return {"status": "blocked", "code": 403, "url": cleaned_url}
+async def fetch_with_browser(url: str) -> str:
+    global browser
+    context = await browser.new_context(
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        locale="en-US",
+        viewport={"width": 1920, "height": 1080}
+    )
+    page = await context.new_page()
+    try:
+        # Load page and wait for Turnstile JS challenge to clear
+        await page.goto(url, wait_until="domcontentloaded", timeout=25000)
+        await asyncio.sleep(3.5)
+        content = await page.content()
+        return content
+    finally:
+        await page.close()
+        await context.close()
 
-    if resp.status_code != 200:
-        return {"status": "error", "code": resp.status_code, "url": cleaned_url}
 
-    html = resp.text
-
-    # Check for soft 404 / search redirect pages
-    title_match = re.search(r"<title[^>]*>(.*?)</title>", html, re.I | re.DOTALL)
-    title = title_match.group(1).lower() if title_match else ""
-    if any(k in title for k in ["404", "not found", "search results for", "لا توجد نتائج"]):
-        return {"status": "invalid_link", "message": "Page redirected to 404/search"}
-
-    # Check for out of stock status
-    is_out_of_stock = bool(re.search(r"\b(out of stock|غير متوفر|نفذت الكمية|غير متاح|مباع بالكامل)\b", html, re.I))
-
-    # Extract price using prioritized parsers
-    price = extract_price(cleaned_url, html)
-
-    if price and price > 0:
-        return {
-            "status": "success",
-            "price": price,
-            "currency": "EGP",
-            "url": cleaned_url
-        }
-
-    if is_out_of_stock:
-        return {"status": "out_of_stock", "price": None, "url": cleaned_url}
-
-    return {"status": "attention_needed", "price": None, "url": cleaned_url}
+def is_out_of_stock_page(html: str) -> bool:
+    return bool(re.search(r"\b(out of stock|غير متوفر|نفذت الكمية|غير متاح|مباع بالكامل)\b", html, re.I))
 
 
 def clean_tracking_params(raw_url: str) -> str:
@@ -80,7 +120,6 @@ def clean_tracking_params(raw_url: str) -> str:
     if not parsed.query:
         return raw_url
     query_dict = urllib.parse.parse_qs(parsed.query)
-    # Keep only e-commerce attributes & Shopify variants
     filtered = {
         k: v for k, v in query_dict.items()
         if k.startswith("attribute_") or k in ["variant", "promo"]
@@ -97,19 +136,17 @@ def extract_price(url: str, html: str) -> float | None:
 
     # 1. Sharaf DG Patterns
     if "sharafdg.com" in url:
-        # Match 'SAVE ... EGP [PRICE]'
         m_save = re.search(r"SAVE\s+(?:\d+%\s+|EGP\s*[\d,.]+\.?\s+)+EGP\s*([\d,.]+)", html, re.I)
         if m_save:
             p = parse_clean_number(m_save.group(1))
             if p: return p
 
-        # Match 'EGP [PRICE]' before checkout tags
         m_egp = re.search(r"EGP\s*([\d,.]+)\.?\s*(?:Easy Payment Plans|Inclusive of VAT|Standard Delivery)", html, re.I)
         if m_egp:
             p = parse_clean_number(m_egp.group(1))
             if p: return p
 
-    # 2. Dubai Phone & WooCommerce Variations (attribute_pa_colors)
+    # 2. Dubai Phone & WooCommerce Variations
     var_form = soup.select_one("form.variations_form")
     if var_form and var_form.get("data-product_variations"):
         try:
@@ -125,7 +162,6 @@ def extract_price(url: str, html: str) -> float | None:
                         if v.get("display_price"):
                             return parse_clean_number(v["display_price"])
 
-            # Fallback to first in-stock variation
             for v in variations:
                 if v.get("is_in_stock") and v.get("display_price"):
                     return parse_clean_number(v["display_price"])
@@ -141,7 +177,6 @@ def extract_price(url: str, html: str) -> float | None:
             data = json.loads(script.string or "{}")
             items = data if isinstance(data, list) else [data]
             for item in items:
-                # Handle @graph wrapper
                 graph = item.get("@graph", [item])
                 for g in graph:
                     if g.get("@type") == "Product" and "offers" in g:
@@ -162,7 +197,7 @@ def extract_price(url: str, html: str) -> float | None:
             p = parse_clean_number(tag["content"])
             if p: return p
 
-    # 5. Scoped WooCommerce Summary (ignores ValU/installment banners)
+    # 5. Scoped WooCommerce Product Summary
     summary = soup.select_one(".summary.entry-summary, .product-info, .entry-summary")
     search_context = summary if summary else soup
 
@@ -180,37 +215,32 @@ def extract_price(url: str, html: str) -> float | None:
 
 
 def parse_clean_number(raw) -> float | None:
-    if raw is None:
-        return None
+    if raw is None: return None
     s = str(raw).strip()
-
-    # Remove tags and entities
     s = re.sub(r"<[^>]+>", " ", s)
     s = re.sub(r"&[a-zA-Z0-9#]+;", " ", s)
 
-    # Strip currency labels
     for curr in ["جنيه مصري", "جنيه", "ج.م.", "ج.م", "جم", "EGP", "egp", "LE", "L.E.", "le", "l.e.", "E£"]:
         s = s.replace(curr, " ")
 
-    # Map Arabic numerals
     arabic_map = {"٠":"0","١":"1","٢":"2","٣":"3","٤":"4","٥":"5","٦":"6","٧":"7","٨":"8","٩":"9","،":","}
     for ar, en in arabic_map.items():
         s = s.replace(ar, en)
     s = s.strip()
 
-    # 1. European format: 28.999,00 -> 28999.00
+    # European format: 28.999,00 -> 28999.00
     m_euro = re.search(r"\b(\d{1,3}(?:\.\d{3})+),(\d{1,2})\b", s)
     if m_euro:
         val = float(m_euro.group(1).replace(".", "") + "." + m_euro.group(2))
         return val if val > 0 else None
 
-    # 2. Dot-thousands: 28.999 -> 28999
+    # Dot-thousands: 28.999 -> 28999
     m_dot = re.search(r"\b(\d{1,3})\.(\d{3})\b(?!\.\d)", s)
     if m_dot:
         val = float(m_dot.group(1) + m_dot.group(2))
         return val if val > 0 else None
 
-    # 3. Comma-thousands: 28,999 or 28,999.00
+    # Comma-thousands: 28,999 or 28,999.00
     m_comma = re.search(r"\b(\d{1,3}(?:,\d{3})+)(?:\.(\d+))?\b", s)
     if m_comma:
         int_part = m_comma.group(1).replace(",", "")
@@ -218,7 +248,7 @@ def parse_clean_number(raw) -> float | None:
         val = float(int_part + dec_part)
         return val if val > 0 else None
 
-    # 4. Standard integers/floats
+    # Plain integers and floats
     m_plain = re.search(r"\b\d+(?:\.\d+)?\b", s)
     if m_plain:
         val = float(m_plain.group(0))
