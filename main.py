@@ -1,46 +1,18 @@
 from fastapi import FastAPI, Query, Body
-from playwright.async_api import async_playwright
-from playwright_stealth import stealth_async
+from curl_cffi import requests
+from bs4 import BeautifulSoup
 import urllib.parse
-import asyncio
 import json
 import re
 
-app = FastAPI(title="Competitor Price Engine", version="2.3.0")
-
-browser = None
-playwright = None
-
-@app.on_event("startup")
-async def startup_event():
-    global playwright, browser
-    playwright = await async_playwright().start()
-    browser = await playwright.chromium.launch(
-        headless=True,
-        args=[
-            "--no-sandbox",
-            "--disable-setuid-sandbox",
-            "--disable-dev-shm-usage",
-            "--disable-infobars",
-            "--window-size=1920,1080",
-            "--disable-blink-features=AutomationControlled"
-        ]
-    )
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    global browser, playwright
-    if browser:
-        await browser.close()
-    if playwright:
-        await playwright.stop()
+app = FastAPI(title="Competitor Price Engine", version="3.0.0")
 
 @app.get("/health")
 def health():
     return {"status": "ok", "port": 5009}
 
 @app.api_route("/get-price", methods=["GET", "POST"])
-async def get_price(url: str = Query(None), payload: dict = Body(None)):
+def get_price(url: str = Query(None), payload: dict = Body(None)):
     target_url = url or (payload.get("url") if payload else None)
     if not target_url:
         return {"status": "error", "message": "Missing 'url' parameter"}
@@ -48,107 +20,51 @@ async def get_price(url: str = Query(None), payload: dict = Body(None)):
     cleaned_url = clean_tracking_params(target_url)
 
     try:
-        result = await fetch_and_evaluate(cleaned_url)
-        raw_price = result.get("price")
-        is_out_of_stock = result.get("is_out_of_stock", False)
+        # Use curl_cffi with chrome impersonation to bypass Cloudflare TLS fingerprinting
+        session = requests.Session(impersonate="chrome124")
+        resp = session.get(
+            cleaned_url,
+            headers={
+                "Accept-Language": "en-US,en;q=0.9,ar;q=0.8",
+                "Upgrade-Insecure-Requests": "1"
+            },
+            timeout=15,
+            allow_redirects=True
+        )
 
-        print(f"[Scrape Result] URL: {cleaned_url} | Source: {result.get('source')} | Raw Price: {raw_price} | OOS: {is_out_of_stock}")
+        code = resp.status_code
+        if code in [404, 410]:
+            return {"status": "invalid_link", "code": code, "url": cleaned_url}
 
-        if raw_price:
-            cleaned_price = parse_clean_number(raw_price)
-            if cleaned_price and cleaned_price > 0:
-                return {
-                    "status": "success",
-                    "price": cleaned_price,
-                    "source": result.get("source"),
-                    "url": cleaned_url
-                }
+        if code in [403, 503]:
+            return {"status": "blocked", "code": code, "url": cleaned_url}
 
-        if is_out_of_stock:
+        if code != 200:
+            return {"status": "error", "code": code, "url": cleaned_url}
+
+        html = resp.text
+
+        # Check out of stock status
+        if is_out_of_stock_page(html):
             return {"status": "out_of_stock", "price": None, "url": cleaned_url}
 
-        return {"status": "attention_needed", "price": None, "debug_html_snippet": result.get("snippet"), "url": cleaned_url}
+        # Extract price
+        price = extract_price(cleaned_url, html)
+        if price and price > 0:
+            return {
+                "status": "success",
+                "price": price,
+                "url": cleaned_url
+            }
+
+        return {"status": "attention_needed", "price": None, "url": cleaned_url}
 
     except Exception as e:
         return {"status": "error", "message": str(e), "url": cleaned_url}
 
 
-async def fetch_and_evaluate(url: str) -> dict:
-    global browser
-    context = await browser.new_context(
-        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        locale="en-US,ar",
-        viewport={"width": 1920, "height": 1080},
-        device_scale_factor=1,
-        has_touch=False
-    )
-    page = await context.new_page()
-
-    # Apply stealth patches to mask Playwright fingerprint
-    await stealth_async(page)
-
-    try:
-        # Wait until network is completely idle to let Cloudflare and JS resolve
-        await page.goto(url, wait_until="networkidle", timeout=30000)
-        await asyncio.sleep(2.0)
-
-        eval_result = await page.evaluate("""() => {
-            const bodyText = document.body ? document.body.innerText : "";
-
-            // 1. Out of stock check
-            const outOfStockRegex = /(?:out of stock|sold out|temporarily unavailable|notify me|currently unavailable|item unavailable|غير متوفر|نفدت الكمية|نفذت الكمية|غير متاح|مباع بالكامل)/i;
-            const isOutOfStock = outOfStockRegex.test(bodyText);
-
-            // 2. Comprehensive price element scan
-            const bdiEls = document.querySelectorAll('ins bdi, .summary bdi, .price bdi, span.price bdi, .woocommerce-Price-amount bdi');
-            for (const el of bdiEls) {
-                const text = el.innerText ? el.innerText.trim() : "";
-                if (text && /\d/.test(text)) {
-                    return { price: text, source: "bdi_element", is_out_of_stock: false };
-                }
-            }
-
-            const amountEls = document.querySelectorAll('.woocommerce-Price-amount, .special-price, .current-price, .price');
-            for (const el of amountEls) {
-                const text = el.innerText ? el.innerText.trim() : "";
-                if (text && /\d/.test(text) && (text.includes("EGP") || text.includes("ج.م") || text.includes("جنية") || /\d{2,}/.test(text))) {
-                    return { price: text, source: "price_container", is_out_of_stock: false };
-                }
-            }
-
-            // 3. Schema JSON-LD
-            const jsonScripts = document.querySelectorAll('script[type="application/ld+json"]');
-            for (const s of jsonScripts) {
-                try {
-                    const parsed = JSON.parse(s.innerText);
-                    const items = Array.isArray(parsed) ? parsed : [parsed];
-                    for (const item of items) {
-                        const graph = item['@graph'] ? item['@graph'] : [item];
-                        for (const g of graph) {
-                            if (g['@type'] === 'Product' && g.offers) {
-                                const off = Array.isArray(g.offers) ? g.offers[0] : g.offers;
-                                const p = off.price || off.lowPrice;
-                                if (p) return { price: String(p), source: "json_ld", is_out_of_stock: false };
-                            }
-                        }
-                    }
-                } catch(e) {}
-            }
-
-            // 4. Meta tags
-            const metaPrice = document.querySelector('meta[property="product:price:amount"], meta[property="og:price:amount"]');
-            if (metaPrice && metaPrice.content) {
-                return { price: metaPrice.content, source: "meta_tag", is_out_of_stock: false };
-            }
-
-            return { price: null, source: "none", is_out_of_stock: isOutOfStock, snippet: bodyText.substring(0, 300) };
-        }""")
-
-        return eval_result
-
-    finally:
-        await page.close()
-        await context.close()
+def is_out_of_stock_page(html: str) -> bool:
+    return bool(re.search(r"\b(out of stock|sold out|temporarily unavailable|notify me|currently unavailable|item unavailable|غير متوفر|نفدت الكمية|نفذت الكمية|غير متاح|مباع بالكامل)\b", html, re.I))
 
 
 def clean_tracking_params(raw_url: str) -> str:
@@ -165,6 +81,86 @@ def clean_tracking_params(raw_url: str) -> str:
         parsed.scheme, parsed.netloc, parsed.path,
         parsed.params, clean_query, parsed.fragment
     ))
+
+
+def extract_price(url: str, html: str) -> float | None:
+    soup = BeautifulSoup(html, "html.parser")
+
+    # 1. Sharaf DG specific text patterns
+    if "sharafdg.com" in url:
+        m_save = re.search(r"SAVE\s+(?:\d+%\s+|EGP\s*[\d,.]+\.?\s+)+EGP\s*([\d,.]+)", html, re.I)
+        if m_save:
+            p = parse_clean_number(m_save.group(1))
+            if p: return p
+
+        m_egp = re.search(r"EGP\s*([\d,.]+)\.?\s*(?:Easy Payment Plans|Inclusive of VAT|Standard Delivery)", html, re.I)
+        if m_egp:
+            p = parse_clean_number(m_egp.group(1))
+            if p: return p
+
+    # 2. WooCommerce Variations (Dubai Phone)
+    var_form = soup.select_one("form.variations_form")
+    if var_form and var_form.get("data-product_variations"):
+        try:
+            variations = json.loads(var_form["data-product_variations"])
+            parsed_url = urllib.parse.urlparse(url)
+            params = urllib.parse.parse_qs(parsed_url.query)
+            attr_params = {k: v[0].lower() for k, v in params.items() if k.startswith("attribute_")}
+
+            if attr_params:
+                for v in variations:
+                    v_attrs = {str(k).lower(): str(val).lower() for k, val in v.get("attributes", {}).items()}
+                    if all(attr_params[k] in v_attrs.get(k, "") for k in attr_params):
+                        if v.get("display_price"):
+                            return parse_clean_number(v["display_price"])
+
+            for v in variations:
+                if v.get("is_in_stock") and v.get("display_price"):
+                    return parse_clean_number(v["display_price"])
+
+            if variations and variations[0].get("display_price"):
+                return parse_clean_number(variations[0]["display_price"])
+        except Exception:
+            pass
+
+    # 3. Schema.org Product JSON-LD
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(script.string or "{}")
+            items = data if isinstance(data, list) else [data]
+            for item in items:
+                graph = item.get("@graph", [item])
+                for g in graph:
+                    if g.get("@type") == "Product" and "offers" in g:
+                        offers = g["offers"]
+                        offer_list = offers if isinstance(offers, list) else [offers]
+                        for off in offer_list:
+                            raw = off.get("price") or off.get("lowPrice")
+                            if raw:
+                                p = parse_clean_number(raw)
+                                if p: return p
+        except Exception:
+            continue
+
+    # 4. OpenGraph & Meta Tags
+    for prop in ["product:price:amount", "og:price:amount", "price"]:
+        tag = soup.find("meta", attrs={"property": prop}) or soup.find("meta", attrs={"name": prop})
+        if tag and tag.get("content"):
+            p = parse_clean_number(tag["content"])
+            if p: return p
+
+    # 5. WooCommerce BDI Elements
+    ins = soup.select_one("ins .woocommerce-Price-amount bdi, ins .amount bdi")
+    if ins:
+        p = parse_clean_number(ins.text)
+        if p: return p
+
+    regular = soup.select_one(".price .woocommerce-Price-amount bdi, .price .amount bdi")
+    if regular:
+        p = parse_clean_number(regular.text)
+        if p: return p
+
+    return None
 
 
 def parse_clean_number(raw) -> float | None:
@@ -204,4 +200,5 @@ def parse_clean_number(raw) -> float | None:
         val = float(m_plain.group(0))
         return val if val > 0 else None
 
-    return None
+    Nones = None
+    return Nones
