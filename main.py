@@ -1,11 +1,12 @@
 from fastapi import FastAPI, Query, Body
 from playwright.async_api import async_playwright
+from playwright_stealth import stealth_async
 import urllib.parse
 import asyncio
 import json
 import re
 
-app = FastAPI(title="Competitor Price Engine", version="2.2.0")
+app = FastAPI(title="Competitor Price Engine", version="2.3.0")
 
 browser = None
 playwright = None
@@ -20,6 +21,8 @@ async def startup_event():
             "--no-sandbox",
             "--disable-setuid-sandbox",
             "--disable-dev-shm-usage",
+            "--disable-infobars",
+            "--window-size=1920,1080",
             "--disable-blink-features=AutomationControlled"
         ]
     )
@@ -75,13 +78,19 @@ async def fetch_and_evaluate(url: str) -> dict:
     context = await browser.new_context(
         user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         locale="en-US,ar",
-        viewport={"width": 1920, "height": 1080}
+        viewport={"width": 1920, "height": 1080},
+        device_scale_factor=1,
+        has_touch=False
     )
     page = await context.new_page()
 
+    # Apply stealth patches to mask Playwright fingerprint
+    await stealth_async(page)
+
     try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=25000)
-        await asyncio.sleep(3.0)
+        # Wait until network is completely idle to let Cloudflare and JS resolve
+        await page.goto(url, wait_until="networkidle", timeout=30000)
+        await asyncio.sleep(2.0)
 
         eval_result = await page.evaluate("""() => {
             const bodyText = document.body ? document.body.innerText : "";
@@ -90,8 +99,7 @@ async def fetch_and_evaluate(url: str) -> dict:
             const outOfStockRegex = /(?:out of stock|sold out|temporarily unavailable|notify me|currently unavailable|item unavailable|غير متوفر|نفدت الكمية|نفذت الكمية|غير متاح|مباع بالكامل)/i;
             const isOutOfStock = outOfStockRegex.test(bodyText);
 
-            // 2. Comprehensive price element scan across WooCommerce, Elementor, and Sharaf DG
-            // Try explicit bdi elements first
+            // 2. Comprehensive price element scan
             const bdiEls = document.querySelectorAll('ins bdi, .summary bdi, .price bdi, span.price bdi, .woocommerce-Price-amount bdi');
             for (const el of bdiEls) {
                 const text = el.innerText ? el.innerText.trim() : "";
@@ -100,7 +108,6 @@ async def fetch_and_evaluate(url: str) -> dict:
                 }
             }
 
-            // Try general amount spans
             const amountEls = document.querySelectorAll('.woocommerce-Price-amount, .special-price, .current-price, .price');
             for (const el of amountEls) {
                 const text = el.innerText ? el.innerText.trim() : "";
@@ -175,19 +182,16 @@ def parse_clean_number(raw) -> float | None:
         s = s.replace(ar, en)
     s = s.strip()
 
-    # European format: 28.999,00 -> 28999.00
     m_euro = re.search(r"\b(\d{1,3}(?:\.\d{3})+),(\d{1,2})\b", s)
     if m_euro:
         val = float(m_euro.group(1).replace(".", "") + "." + m_euro.group(2))
         return val if val > 0 else None
 
-    # Dot-thousands: 28.999 -> 28999
     m_dot = re.search(r"\b(\d{1,3})\.(\d{3})\b(?!\.\d)", s)
     if m_dot:
         val = float(m_dot.group(1) + m_dot.group(2))
         return val if val > 0 else None
 
-    # Comma-thousands: 28,999 or 1,499.00
     m_comma = re.search(r"\b(\d{1,3}(?:,\d{3})+)(?:\.(\d+))?\b", s)
     if m_comma:
         int_part = m_comma.group(1).replace(",", "")
@@ -195,7 +199,6 @@ def parse_clean_number(raw) -> float | None:
         val = float(int_part + dec_part)
         return val if val > 0 else None
 
-    # Plain digits
     m_plain = re.search(r"\b\d+(?:\.\d+)?\b", s)
     if m_plain:
         val = float(m_plain.group(0))
