@@ -1,52 +1,59 @@
 from fastapi import FastAPI, Query, Body
-from curl_cffi import requests
+from playwright.async_api import async_playwright
+from playwright_stealth import stealth_async
 from bs4 import BeautifulSoup
 import urllib.parse
+import asyncio
 import json
 import re
 
-app = FastAPI(title="Competitor Price Engine", version="3.3.0")
+app = FastAPI(title="Dubai Phone & Competitor Engine", version="4.0.0")
+
+browser = None
+playwright = None
+
+@app.on_event("startup")
+async def startup_event():
+    global playwright, browser
+    playwright = await async_playwright().start()
+    browser = await playwright.chromium.launch(
+        headless=True,
+        args=[
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-blink-features=AutomationControlled"
+        ]
+    )
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    global browser, playwright
+    if browser:
+        await browser.close()
+    if playwright:
+        await playwright.stop()
 
 @app.get("/health")
 def health():
     return {"status": "ok", "port": 5009}
 
 @app.api_route("/get-price", methods=["GET", "POST"])
-def get_price(url: str = Query(None), payload: dict = Body(None)):
+async def get_price(url: str = Query(None), payload: dict = Body(None)):
     target_url = url or (payload.get("url") if payload else None)
     if not target_url:
         return {"status": "error", "message": "Missing 'url' parameter"}
 
     cleaned_url = clean_tracking_params(target_url)
 
-    # 1. DUBAI PHONE DEDICATED FAST PATH (Public WooCommerce Store API)
-    if "dubaiphone.net" in cleaned_url:
-        api_result = fetch_dubaiphone_store_api(cleaned_url)
-        if api_result:
-            return api_result
-
-    # 2. STANDARD SCRAPE (curl_cffi with pure Chrome 124 fingerprint)
     try:
-        session = requests.Session(impersonate="chrome124")
-        resp = session.get(cleaned_url, timeout=15, allow_redirects=True)
+        html, final_url = await fetch_with_vercel_wait(cleaned_url)
 
-        code = resp.status_code
-        if code in [404, 410]:
-            return {"status": "invalid_link", "code": code, "url": cleaned_url}
-
-        if code in [403, 429, 503]:
-            return {"status": "blocked", "code": code, "url": cleaned_url}
-
-        if code != 200:
-            return {"status": "error", "code": code, "url": cleaned_url}
-
-        html = resp.text
-
-        # Check out of stock status
+        # 1. Out of stock check
         if is_out_of_stock_page(html):
             return {"status": "out_of_stock", "price": None, "url": cleaned_url}
 
-        # Extract price from HTML
+        # 2. Extract price
         price = extract_price(cleaned_url, html)
         if price and price > 0:
             return {
@@ -61,43 +68,39 @@ def get_price(url: str = Query(None), payload: dict = Body(None)):
         return {"status": "error", "message": str(e), "url": cleaned_url}
 
 
-def fetch_dubaiphone_store_api(url: str) -> dict | None:
-    """Directly queries WooCommerce Store API to extract exact price and stock status."""
+async def fetch_with_vercel_wait(url: str):
+    global browser
+    context = await browser.new_context(
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        locale="en-US,ar",
+        viewport={"width": 1920, "height": 1080}
+    )
+    page = await context.new_page()
+    await stealth_async(page)
+
     try:
-        slug_match = re.search(r"/shop/([^/?]+)", url)
-        if not slug_match:
-            return None
+        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
 
-        slug = slug_match.group(1)
-        api_url = f"https://www.dubaiphone.net/wp-json/wc/store/v1/products?slug={slug}"
+        # Check if intercepted by Vercel Security Checkpoint
+        current_title = await page.title()
+        if "Vercel Security Checkpoint" in current_title or "Security Checkpoint" in current_title:
+            print("[Vercel Detected] Waiting for verification challenge to resolve...")
+            try:
+                # Wait until Vercel verification completes and reloads to the store page
+                await page.wait_for_function("() => !document.title.includes('Vercel')", timeout=20000)
+                await page.wait_for_load_state("domcontentloaded")
+                await asyncio.sleep(2.0)
+            except Exception as wait_err:
+                print(f"[Vercel Wait Timeout] {wait_err}")
 
-        session = requests.Session(impersonate="chrome124")
-        res = session.get(api_url, timeout=10)
+        # Let dynamic WooCommerce variations populate
+        await asyncio.sleep(1.5)
+        content = await page.content()
+        return content, page.url
 
-        if res.status_code == 200:
-            items = res.json()
-            if isinstance(items, list) and len(items) > 0:
-                item = items[0]
-
-                # Check stock
-                if item.get("is_in_stock") is False:
-                    return {"status": "out_of_stock", "price": None, "url": url}
-
-                # Check prices object
-                prices = item.get("prices", {})
-                raw_price = prices.get("price") or prices.get("sale_price") or prices.get("regular_price")
-                if raw_price:
-                    minor_unit = prices.get("currency_minor_unit", 2)
-                    final_val = float(raw_price) / (10 ** minor_unit)
-                    if final_val > 0:
-                        return {"status": "success", "price": final_val, "source": "wc_store_api", "url": url}
-    except Exception:
-        pass
-    return None
-
-
-def is_out_of_stock_page(html: str) -> bool:
-    return bool(re.search(r"\b(out of stock|sold out|temporarily unavailable|notify me|currently unavailable|item unavailable|غير متوفر|نفدت الكمية|نفذت الكمية|غير متاح|مباع بالكامل)\b", html, re.I))
+    finally:
+        await page.close()
+        await context.close()
 
 
 def clean_tracking_params(raw_url: str) -> str:
@@ -116,20 +119,41 @@ def clean_tracking_params(raw_url: str) -> str:
     ))
 
 
+def is_out_of_stock_page(html: str) -> bool:
+    return bool(re.search(r"\b(out of stock|sold out|temporarily unavailable|notify me|currently unavailable|item unavailable|غير متوفر|نفدت الكمية|نفذت الكمية|غير متاح|مباع بالكامل)\b", html, re.I))
+
+
 def extract_price(url: str, html: str) -> float | None:
     soup = BeautifulSoup(html, "html.parser")
 
-    # 1. Sharaf DG Patterns
-    if "sharafdg.com" in url:
-        m_save = re.search(r"SAVE\s+(?:\d+%\s+|EGP\s*[\d,.]+\.?\s+)+EGP\s*([\d,.]+)", html, re.I)
-        if m_save:
-            p = parse_clean_number(m_save.group(1))
-            if p: return p
+    # 1. WooCommerce Variations (Dubai Phone specific variant matching)
+    var_form = soup.select_one("form.variations_form")
+    if var_form and var_form.get("data-product_variations"):
+        try:
+            variations = json.loads(var_form["data-product_variations"])
+            parsed_url = urllib.parse.urlparse(url)
+            params = urllib.parse.parse_qs(parsed_url.query)
+            attr_params = {k.lower(): v[0].lower().strip() for k, v in params.items() if k.startswith("attribute_")}
 
-        m_egp = re.search(r"EGP\s*([\d,.]+)\.?\s*(?:Easy Payment Plans|Inclusive of VAT|Standard Delivery)", html, re.I)
-        if m_egp:
-            p = parse_clean_number(m_egp.group(1))
-            if p: return p
+            if attr_params and isinstance(variations, list):
+                for v in variations:
+                    v_attrs = {str(k).lower(): str(val).lower().strip() for k, val in v.get("attributes", {}).items()}
+                    if all(attr_params[k] in v_attrs.get(k, "") for k in attr_params):
+                        if v.get("display_price"):
+                            p = parse_clean_number(v["display_price"])
+                            if p and p > 0: return p
+
+            if isinstance(variations, list):
+                for v in variations:
+                    if v.get("is_in_stock") and v.get("display_price"):
+                        p = parse_clean_number(v["display_price"])
+                        if p and p > 0: return p
+
+                if variations and variations[0].get("display_price"):
+                    p = parse_clean_number(variations[0]["display_price"])
+                    if p and p > 0: return p
+        except Exception:
+            pass
 
     # 2. Schema.org Product JSON-LD
     for script in soup.find_all("script", type="application/ld+json"):
@@ -146,23 +170,27 @@ def extract_price(url: str, html: str) -> float | None:
                             raw = off.get("price") or off.get("lowPrice")
                             if raw:
                                 p = parse_clean_number(raw)
-                                if p: return p
+                                if p and p > 0: return p
         except Exception:
             continue
 
-    # 3. OpenGraph / Meta tags
+    # 3. OpenGraph / Meta Tag Price
     for prop in ["product:price:amount", "og:price:amount", "price"]:
         tag = soup.find("meta", attrs={"property": prop}) or soup.find("meta", attrs={"name": prop})
         if tag and tag.get("content"):
             p = parse_clean_number(tag["content"])
-            if p: return p
+            if p and p > 0: return p
 
-    # 4. Global BDI tag search (Works across all WooCommerce themes)
+    # 4. Scoped Product Summary Price (Avoids 0.00 header cart)
+    summary_price = soup.select(".summary p.price bdi, .product-summary .price bdi, div.entry-summary p.price bdi")
+    for bdi in summary_price:
+        p = parse_clean_number(bdi.get_text())
+        if p and p > 0: return p
+
+    # 5. Global BDI Scan
     for bdi in soup.find_all("bdi"):
-        text = bdi.get_text().strip()
-        p = parse_clean_number(text)
-        if p and p > 0:
-            return p
+        p = parse_clean_number(bdi.get_text())
+        if p and p > 0: return p
 
     return None
 
