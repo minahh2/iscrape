@@ -1,44 +1,18 @@
 from fastapi import FastAPI, Query, Body
-from playwright.async_api import async_playwright
+from curl_cffi import requests
 from bs4 import BeautifulSoup
 import urllib.parse
-import asyncio
 import json
 import re
 
-app = FastAPI(title="Competitor Price Engine", version="4.1.0")
-
-browser = None
-playwright = None
-
-@app.on_event("startup")
-async def startup_event():
-    global playwright, browser
-    playwright = await async_playwright().start()
-    browser = await playwright.chromium.launch(
-        headless=True,
-        args=[
-            "--no-sandbox",
-            "--disable-setuid-sandbox",
-            "--disable-dev-shm-usage",
-            "--disable-blink-features=AutomationControlled"
-        ]
-    )
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    global browser, playwright
-    if browser:
-        await browser.close()
-    if playwright:
-        await playwright.stop()
+app = FastAPI(title="Competitor Price Engine", version="4.2.0")
 
 @app.get("/health")
 def health():
     return {"status": "ok", "port": 5009}
 
 @app.api_route("/get-price", methods=["GET", "POST"])
-async def get_price(url: str = Query(None), payload: dict = Body(None)):
+def get_price(url: str = Query(None), payload: dict = Body(None)):
     target_url = url or (payload.get("url") if payload else None)
     if not target_url:
         return {"status": "error", "message": "Missing 'url' parameter"}
@@ -46,7 +20,38 @@ async def get_price(url: str = Query(None), payload: dict = Body(None)):
     cleaned_url = clean_tracking_params(target_url)
 
     try:
-        html = await fetch_with_vercel_wait(cleaned_url)
+        # Use curl_cffi impersonating Chrome 124 to bypass TLS fingerprint blocks on Vercel/Cloudflare
+        session = requests.Session(impersonate="chrome124")
+        domain = urllib.parse.urlparse(cleaned_url).netloc
+        
+        resp = session.get(
+            cleaned_url,
+            headers={
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9,ar;q=0.8",
+                "Cache-Control": "no-cache",
+                "Upgrade-Insecure-Requests": "1",
+                "Referer": f"https://{domain}/"
+            },
+            timeout=15,
+            allow_redirects=True
+        )
+
+        code = resp.status_code
+        if code in [404, 410]:
+            return {"status": "invalid_link", "code": code, "url": cleaned_url}
+
+        if code in [403, 429, 503]:
+            return {"status": "blocked", "code": code, "url": cleaned_url}
+
+        if code != 200:
+            return {"status": "error", "code": code, "url": cleaned_url}
+
+        html = resp.text
+
+        # Check for Vercel checkpoint or out of stock
+        if "Vercel Security Checkpoint" in html:
+            return {"status": "blocked", "message": "Vercel Checkpoint", "url": cleaned_url}
 
         if is_out_of_stock_page(html):
             return {"status": "out_of_stock", "price": None, "url": cleaned_url}
@@ -65,39 +70,8 @@ async def get_price(url: str = Query(None), payload: dict = Body(None)):
         return {"status": "error", "message": str(e), "url": cleaned_url}
 
 
-async def fetch_with_vercel_wait(url: str) -> str:
-    global browser
-    context = await browser.new_context(
-        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        locale="en-US,ar",
-        viewport={"width": 1920, "height": 1080}
-    )
-    page = await context.new_page()
-
-    # Mask navigator.webdriver
-    await page.add_init_script("""
-        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-    """)
-
-    try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=35000)
-
-        # Handle Vercel Security Checkpoint
-        current_title = await page.title()
-        if "Vercel" in current_title or "Security Checkpoint" in current_title:
-            try:
-                await page.wait_for_function("() => !document.title.includes('Vercel')", timeout=20000)
-                await page.wait_for_load_state("domcontentloaded")
-                await asyncio.sleep(2.0)
-            except Exception:
-                pass
-
-        await asyncio.sleep(1.5)
-        return await page.content()
-
-    finally:
-        await page.close()
-        await context.close()
+def is_out_of_stock_page(html: str) -> bool:
+    return bool(re.search(r"\b(out of stock|sold out|temporarily unavailable|notify me|currently unavailable|item unavailable|غير متوفر|نفدت الكمية|نفذت الكمية|غير متاح|مباع بالكامل)\b", html, re.I))
 
 
 def clean_tracking_params(raw_url: str) -> str:
@@ -116,19 +90,14 @@ def clean_tracking_params(raw_url: str) -> str:
     ))
 
 
-def is_out_of_stock_page(html: str) -> bool:
-    return bool(re.search(r"\b(out of stock|sold out|temporarily unavailable|notify me|currently unavailable|item unavailable|غير متوفر|نفدت الكمية|نفذت الكمية|غير متاح|مباع بالكامل)\b", html, re.I))
-
-
 def extract_price(url: str, html: str) -> float | None:
     soup = BeautifulSoup(html, "html.parser")
 
-    # 1. WooCommerce Variations (Match selected attribute like ?attribute_pa_colors=black)
+    # 1. WooCommerce Variations (Dubai Phone)
     var_form = soup.select_one("form.variations_form")
     if var_form and var_form.get("data-product_variations"):
         try:
-            raw_attr = var_form["data-product_variations"]
-            variations = json.loads(raw_attr)
+            variations = json.loads(var_form["data-product_variations"])
             parsed_url = urllib.parse.urlparse(url)
             params = urllib.parse.parse_qs(parsed_url.query)
             attr_params = {k.lower(): v[0].lower().strip() for k, v in params.items() if k.startswith("attribute_")}
@@ -153,7 +122,7 @@ def extract_price(url: str, html: str) -> float | None:
         except Exception:
             pass
 
-    # 2. Schema.org Product JSON-LD
+    # 2. Schema.org JSON-LD
     for script in soup.find_all("script", type="application/ld+json"):
         try:
             data = json.loads(script.string or "{}")
@@ -172,20 +141,14 @@ def extract_price(url: str, html: str) -> float | None:
         except Exception:
             continue
 
-    # 3. OpenGraph / Meta Tag Price
+    # 3. Meta Tags
     for prop in ["product:price:amount", "og:price:amount", "price"]:
         tag = soup.find("meta", attrs={"property": prop}) or soup.find("meta", attrs={"name": prop})
         if tag and tag.get("content"):
             p = parse_clean_number(tag["content"])
             if p and p > 0: return p
 
-    # 4. Scoped Product Summary Price
-    summary_price = soup.select(".summary p.price bdi, .product-summary .price bdi, div.entry-summary p.price bdi")
-    for bdi in summary_price:
-        p = parse_clean_number(bdi.get_text())
-        if p and p > 0: return p
-
-    # 5. Global BDI Tag Search
+    # 4. Global BDI search
     for bdi in soup.find_all("bdi"):
         p = parse_clean_number(bdi.get_text())
         if p and p > 0: return p
