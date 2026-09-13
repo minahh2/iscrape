@@ -1,13 +1,12 @@
 from fastapi import FastAPI, Query, Body
 from playwright.async_api import async_playwright
-from playwright_stealth import stealth_async
 from bs4 import BeautifulSoup
 import urllib.parse
 import asyncio
 import json
 import re
 
-app = FastAPI(title="Dubai Phone & Competitor Engine", version="4.0.0")
+app = FastAPI(title="Competitor Price Engine", version="4.1.0")
 
 browser = None
 playwright = None
@@ -47,13 +46,11 @@ async def get_price(url: str = Query(None), payload: dict = Body(None)):
     cleaned_url = clean_tracking_params(target_url)
 
     try:
-        html, final_url = await fetch_with_vercel_wait(cleaned_url)
+        html = await fetch_with_vercel_wait(cleaned_url)
 
-        # 1. Out of stock check
         if is_out_of_stock_page(html):
             return {"status": "out_of_stock", "price": None, "url": cleaned_url}
 
-        # 2. Extract price
         price = extract_price(cleaned_url, html)
         if price and price > 0:
             return {
@@ -68,7 +65,7 @@ async def get_price(url: str = Query(None), payload: dict = Body(None)):
         return {"status": "error", "message": str(e), "url": cleaned_url}
 
 
-async def fetch_with_vercel_wait(url: str):
+async def fetch_with_vercel_wait(url: str) -> str:
     global browser
     context = await browser.new_context(
         user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -76,27 +73,27 @@ async def fetch_with_vercel_wait(url: str):
         viewport={"width": 1920, "height": 1080}
     )
     page = await context.new_page()
-    await stealth_async(page)
+
+    # Mask navigator.webdriver
+    await page.add_init_script("""
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    """)
 
     try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        await page.goto(url, wait_until="domcontentloaded", timeout=35000)
 
-        # Check if intercepted by Vercel Security Checkpoint
+        # Handle Vercel Security Checkpoint
         current_title = await page.title()
-        if "Vercel Security Checkpoint" in current_title or "Security Checkpoint" in current_title:
-            print("[Vercel Detected] Waiting for verification challenge to resolve...")
+        if "Vercel" in current_title or "Security Checkpoint" in current_title:
             try:
-                # Wait until Vercel verification completes and reloads to the store page
                 await page.wait_for_function("() => !document.title.includes('Vercel')", timeout=20000)
                 await page.wait_for_load_state("domcontentloaded")
                 await asyncio.sleep(2.0)
-            except Exception as wait_err:
-                print(f"[Vercel Wait Timeout] {wait_err}")
+            except Exception:
+                pass
 
-        # Let dynamic WooCommerce variations populate
         await asyncio.sleep(1.5)
-        content = await page.content()
-        return content, page.url
+        return await page.content()
 
     finally:
         await page.close()
@@ -126,11 +123,12 @@ def is_out_of_stock_page(html: str) -> bool:
 def extract_price(url: str, html: str) -> float | None:
     soup = BeautifulSoup(html, "html.parser")
 
-    # 1. WooCommerce Variations (Dubai Phone specific variant matching)
+    # 1. WooCommerce Variations (Match selected attribute like ?attribute_pa_colors=black)
     var_form = soup.select_one("form.variations_form")
     if var_form and var_form.get("data-product_variations"):
         try:
-            variations = json.loads(var_form["data-product_variations"])
+            raw_attr = var_form["data-product_variations"]
+            variations = json.loads(raw_attr)
             parsed_url = urllib.parse.urlparse(url)
             params = urllib.parse.parse_qs(parsed_url.query)
             attr_params = {k.lower(): v[0].lower().strip() for k, v in params.items() if k.startswith("attribute_")}
@@ -181,13 +179,13 @@ def extract_price(url: str, html: str) -> float | None:
             p = parse_clean_number(tag["content"])
             if p and p > 0: return p
 
-    # 4. Scoped Product Summary Price (Avoids 0.00 header cart)
+    # 4. Scoped Product Summary Price
     summary_price = soup.select(".summary p.price bdi, .product-summary .price bdi, div.entry-summary p.price bdi")
     for bdi in summary_price:
         p = parse_clean_number(bdi.get_text())
         if p and p > 0: return p
 
-    # 5. Global BDI Scan
+    # 5. Global BDI Tag Search
     for bdi in soup.find_all("bdi"):
         p = parse_clean_number(bdi.get_text())
         if p and p > 0: return p
